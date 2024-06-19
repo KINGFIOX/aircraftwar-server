@@ -1,10 +1,11 @@
+use server::run;
+
 mod server;
 
-fn main() {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(async {
-        // TODO
-    });
+#[tokio::main]
+async fn main() {
+    // TODO
+    run().await;
 
     println!("Hello, world!");
 }
