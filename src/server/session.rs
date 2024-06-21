@@ -46,7 +46,7 @@ impl Client {
                         dbg!(&game_end);
                         end_tx.send(game_end.score)?;
                         break;
-                    } else if value.get("score").is_some() {
+                    } else if value.get("value").is_some() {
                         let score: Score = serde_json::from_value(value.clone())?;
                         score_tx.send(score.value)?;
                         // dbg!(&score);
@@ -67,6 +67,7 @@ impl Client {
                 Ok(_) => {}
                 Err(e) => {
                     dbg!(e);
+                    // 垃圾回收
                     return Err(ClientErr::RecvError);
                 }
             }
@@ -286,13 +287,14 @@ pub async fn run() -> Result<(), ServerError> {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9999").await?;
     dbg!(&listener);
 
-    let mut buffer = Vec::new();
+    let mut ez_buffer = Vec::new();
+
     while let Ok((stream, _)) = listener.accept().await {
         dbg!(&stream);
         let ws_stream = accept_async(stream).await.unwrap();
-        buffer.push(ws_stream);
-        if buffer.len() >= 2 {
-            let (client1_ws, client2_ws) = (buffer.remove(0), buffer.remove(0));
+        ez_buffer.push(ws_stream);
+        if ez_buffer.len() >= 2 {
+            let (client1_ws, client2_ws) = (ez_buffer.remove(0), ez_buffer.remove(0));
 
             let _ = Session::broadcast_start(client1_ws, client2_ws).await;
         }
