@@ -1,6 +1,6 @@
 use futures_util::{ SinkExt, StreamExt };
-use serde_json::Value;
-use tokio::{ net::{ TcpStream }, sync::mpsc::{ self, UnboundedSender }, task::JoinHandle };
+use serde_json::{ json, Value };
+use tokio::{ net::TcpStream, select, sync::mpsc::{ self, UnboundedSender }, task::JoinHandle };
 use tokio_tungstenite::{ accept_async, tungstenite::{ self, client, WebSocket }, WebSocketStream };
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio::sync::{ Mutex };
@@ -8,7 +8,9 @@ use std::{ collections::HashMap, sync::Arc };
 use serde::{ Serialize, Deserialize };
 use uuid::Uuid;
 
-use super::{ ClientErr, ServerError, SessionErr };
+use crate::server::{ GameBegin, GameEnd };
+
+use super::{ ClientErr, Score, ServerError, SessionErr };
 
 type Socket = Arc<Mutex<WebSocketStream<TcpStream>>>;
 
@@ -25,27 +27,8 @@ struct Session {
     thread: JoinHandle<Result<(), SessionErr>>,
 }
 
-/// 从 Server 发出去是 "begin"
-/// Client 在没有收到 "begin"
-#[derive(Serialize, Deserialize, Debug)]
-struct GameBegin {
-    begin: String,
-}
-
-/// 来自于 Client 只能是 "end"
-/// 从 Server 发出去是 "wait" 或者是 "end"
-#[derive(Serialize, Deserialize, Debug)]
-struct GameEnd {
-    end: String,
-    score: i32,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Score {
-    score: i32,
-}
-
 impl Client {
+    /// 主要是管道，专门用来接收的
     /// 主要是管道，专门用来接收的
     async fn handle_client(
         conn: Socket,
@@ -58,27 +41,28 @@ impl Client {
                 Ok(Message::Text(text)) => {
                     let value: Value = serde_json::from_str(&text)?;
 
-                    if value.get("begin").is_some() {
-                        let game_begin: GameBegin = serde_json::from_value(value)?;
-                        dbg!(&game_begin);
-                        // 处理 game_begin 消息
-                    } else if value.get("end").is_some() {
-                        let game_end: GameEnd = serde_json::from_value(value)?;
+                    if value.get("end").is_some() {
+                        let game_end: GameEnd = serde_json::from_value(value.clone())?;
                         dbg!(&game_end);
                         end_tx.send(game_end.score)?;
-                        // break;
+                        break;
                     } else if value.get("score").is_some() {
-                        let score: Score = serde_json::from_value(value)?;
-                        score_tx.send(score.score)?;
+                        let score: Score = serde_json::from_value(value.clone())?;
+                        score_tx.send(score.value)?;
                         // dbg!(&score);
                     } else {
-                        dbg!("Unknown message type");
+                        /*else if value.get("begin").is_some() {
+                        let game_begin: GameBegin = serde_json::from_value(value.clone())?;
+                        dbg!(&game_begin);
+                        // Do something with GameBegin if necessary
+                    } */ dbg!("Unknown message type");
+                        dbg!("unknown message type: ", &text);
                     }
                 }
                 Ok(Message::Close(frame)) => {
                     dbg!(frame);
                     disconnect_tx.send(true)?;
-                    return Ok(()); // 应该是会销毁所有的 tx
+                    return Ok(()); // Should destroy all tx
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -184,199 +168,113 @@ impl Session {
         mut disconnect_rx0: mpsc::UnboundedReceiver<bool>,
         mut disconnect_rx1: mpsc::UnboundedReceiver<bool>
     ) -> Result<(), SessionErr> {
-        let mut gaming0: bool = true;
+        let mut gaming0 = true;
+        let mut gaming1 = true;
 
-        let mut gaming1: bool = true;
-
-        // polling
         loop {
-            /* ---------- gamer 0 ---------- */
-            match score_rx0.try_recv() {
-                Ok(score) => {
+            select! {
+            // Handle messages from gamer 0
+            msg = score_rx0.recv() => {
+                if let Some(score) = msg {
+                    clients.lock().await.0.score = score;
+                    let clients = clients.lock().await;
+                    if let Err(e) = clients.1.conn
+                        .lock().await
+                        .send(
+                            Message::Text(json!(Score { value: clients.0.score }).to_string())
+                        ).await
+                    {
+                        if !matches!(e, tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) {
+                            return Err(e.into());
+                        }
+                    };
+                }
+            },
+            end = end_rx0.recv() => {
+                if let Some(score) = end {
+                    gaming0 = false;
                     clients.lock().await.0.score = score;
                 }
-                Err(e) => {
-                    match e {
-                        mpsc::error::TryRecvError::Disconnected => {
-                            gaming0 = false; /* 上面断开的时候减过了 */
-                        }
-                        mpsc::error::TryRecvError::Empty => {/* 没有数据不是错误 */}
-                    }
-                }
-            }
-
-            match disconnect_rx0.try_recv() {
-                Ok(true) => {
+            },
+            disconnect = disconnect_rx0.recv() => {
+                if let Some(true) = disconnect {
                     gaming0 = false;
                 }
-                Ok(false) => {/*  */}
-                Err(e) => {
-                    match e {
-                        mpsc::error::TryRecvError::Disconnected => {/* 上面断开的时候减过了 */}
-                        mpsc::error::TryRecvError::Empty => {/* 没有数据不是错误 */}
-                    }
-                }
-            }
+            },
 
-            match end_rx0.try_recv() {
-                Ok(score) => {
-                    gaming0 = false;
-                    dbg!(&score);
-                    clients.lock().await.0.score = score;
-                }
-                Err(e) => {
-                    match e {
-                        mpsc::error::TryRecvError::Disconnected => {/* 上面断开的时候减过了 */}
-                        mpsc::error::TryRecvError::Empty => {/* 没有数据不是错误 */}
-                    }
-                }
-            }
-
-            /* ---------- gamer 1 ---------- */
-
-            match score_rx1.try_recv() {
-                Ok(score) => {
+            // Handle messages from gamer 1
+            msg = score_rx1.recv() => {
+                if let Some(score) = msg {
                     clients.lock().await.1.score = score;
-                }
-                Err(e) => {
-                    match e {
-                        mpsc::error::TryRecvError::Disconnected => {
-                            gaming1 = false;
-                            /* 上面断开的时候减过了 */
+                    let clients = clients.lock().await;
+                        if let Err(e) = clients.0.conn
+                        .lock().await
+                        .send(
+                            Message::Text(json!(Score { value: clients.0.score }).to_string())
+                        ).await
+                    {
+                        if !matches!(e, tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) {
+                            return Err(e.into());
                         }
-                        mpsc::error::TryRecvError::Empty => {/* 没有数据不是错误 */}
-                    }
+                    };
                 }
-            }
-
-            match disconnect_rx1.try_recv() {
-                Ok(true) => {
+            },
+            end = end_rx1.recv() => {
+                if let Some(score) = end {
                     gaming1 = false;
-                }
-                Ok(false) => {/*  */}
-                Err(e) => {
-                    match e {
-                        mpsc::error::TryRecvError::Disconnected => {/* 上面断开的时候减过了 */}
-                        mpsc::error::TryRecvError::Empty => {/* 没有数据不是错误 */}
-                    }
-                }
-            }
-
-            match end_rx1.try_recv() {
-                Ok(score) => {
-                    gaming1 = false;
-                    dbg!(&score);
                     clients.lock().await.1.score = score;
                 }
-                Err(e) => {
-                    match e {
-                        mpsc::error::TryRecvError::Disconnected => {/* 上面断开的时候减过了 */}
-                        mpsc::error::TryRecvError::Empty => {/* 没有数据不是错误 */}
-                    }
+            },
+            disconnect = disconnect_rx1.recv() => {
+                if let Some(true) = disconnect {
+                    gaming1 = false;
                 }
-            }
+            },
+        }
 
-            /* 发送分数给双方 */
-            {
+            // Check for game over
+            if !gaming0 && !gaming1 {
+                dbg!("game over");
                 let clients = clients.lock().await;
+                // Notify gamer 0
                 if
                     let Err(e) = clients.0.conn.lock().await.send(
                         Message::Text(
-                            serde_json::to_string(
-                                &(Score {
-                                    score: clients.1.score,
-                                })
-                            )?
+                            json!(GameEnd {
+                                end: "end".to_string(),
+                                score: clients.1.score,
+                            }).to_string()
                         )
                     ).await
                 {
                     if
-                        let
-                        | tungstenite::Error::ConnectionClosed
-                        | tungstenite::Error::AlreadyClosed = e
+                        !matches!(
+                            e,
+                            tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed
+                        )
                     {
-                    } else {
                         return Err(e.into());
                     }
                 }
-
+                // Notify gamer 1
                 if
                     let Err(e) = clients.1.conn.lock().await.send(
                         Message::Text(
-                            serde_json::to_string(
-                                &(Score {
-                                    score: clients.0.score,
-                                })
-                            )?
+                            json!(GameEnd {
+                                end: "end".to_string(),
+                                score: clients.0.score,
+                            }).to_string()
                         )
                     ).await
                 {
                     if
-                        let
-                        | tungstenite::Error::ConnectionClosed
-                        | tungstenite::Error::AlreadyClosed = e
+                        !matches!(
+                            e,
+                            tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed
+                        )
                     {
-                    } else {
                         return Err(e.into());
                     }
-                };
-            }
-
-            /* ---------- 结束标志 ---------- */
-
-            if !gaming0 && !gaming1 {
-                dbg!("game over");
-
-                /* ---------- 0 号玩家 ---------- */
-                {
-                    let clients = clients.lock().await;
-                    if
-                        let Err(e) = clients.0.conn.lock().await.send(
-                            Message::Text(
-                                serde_json::to_string(
-                                    &(GameEnd {
-                                        end: "end".to_string(),
-                                        score: clients.1.score, // 传对方的分数
-                                    })
-                                )?
-                            )
-                        ).await
-                    {
-                        if
-                            let
-                            | tungstenite::Error::ConnectionClosed
-                            | tungstenite::Error::AlreadyClosed = e
-                        {
-                        } else {
-                            return Err(e.into());
-                        }
-                    };
-                }
-
-                /* ---------- 1 号玩家 ---------- */
-                {
-                    let clients = clients.lock().await;
-                    if
-                        let Err(e) = clients.1.conn.lock().await.send(
-                            Message::Text(
-                                serde_json::to_string(
-                                    &(GameEnd {
-                                        end: "end".to_string(),
-                                        score: clients.0.score,
-                                    })
-                                )?
-                            )
-                        ).await
-                    {
-                        if
-                            let
-                            | tungstenite::Error::ConnectionClosed
-                            | tungstenite::Error::AlreadyClosed = e
-                        {
-                        } else {
-                            return Err(e.into());
-                        }
-                    };
                 }
                 return Ok(());
             }
