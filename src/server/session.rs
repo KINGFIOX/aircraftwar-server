@@ -1,4 +1,4 @@
-use futures_util::{ SinkExt, StreamExt };
+use futures_util::{ stream::FusedStream, SinkExt, StreamExt };
 use serde_json::{ json, Value };
 use tokio::{ net::TcpStream, select, sync::mpsc::{ self, UnboundedSender }, task::JoinHandle };
 use tokio_tungstenite::{ accept_async, tungstenite::{ self, client, WebSocket }, WebSocketStream };
@@ -28,7 +28,6 @@ struct Session {
 }
 
 impl Client {
-    /// 主要是管道，专门用来接收的
     /// 主要是管道，专门用来接收的
     async fn handle_client(
         conn: Socket,
@@ -294,8 +293,15 @@ pub async fn run() -> Result<(), ServerError> {
         let ws_stream = accept_async(stream).await.unwrap();
         ez_buffer.push(ws_stream);
         if ez_buffer.len() >= 2 {
-            let (client1_ws, client2_ws) = (ez_buffer.remove(0), ez_buffer.remove(0));
-
+            let (client1_ws, client2_ws) = (ez_buffer.pop().unwrap(), ez_buffer.pop().unwrap());
+            if client1_ws.is_terminated() {
+                ez_buffer.push(client2_ws);
+                continue;
+            }
+            if client2_ws.is_terminated() {
+                ez_buffer.push(client1_ws);
+                continue;
+            }
             let _ = Session::broadcast_start(client1_ws, client2_ws).await;
         }
     }
